@@ -1,0 +1,85 @@
+
+name: Release to AWS (Terraform)
+
+on:
+  # Manual run option in Actions tab
+  workflow_dispatch:
+  # Auto-run when you publish a GitHub Release (e.g., v1.0.0)
+  release:
+    types: [ published ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC to assume AWS role
+      contents: read
+
+    # Environment values coming from repo secrets
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      # Prefer DOCKER_IMAGE_REPO secret; else fall back to brannt-deleeuw-personal under your DockerHub user
+      DOCKER_IMAGE_REPO: ${{ secrets.DOCKER_IMAGE_REPO || format('docker.io/{0}/brannt-deleeuw-personal', secrets.DOCKERHUB_USERNAME) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- AWS authentication (OIDC recommended) ---
+      - name: Configure AWS credentials (OIDC)
+        if: secrets.AWS_ROLE_ARN
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure AWS credentials (static keys)
+        if: (!secrets.AWS_ROLE_ARN) && secrets.AWS_ACCESS_KEY_ID && secrets.AWS_SECRET_ACCESS_KEY
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --- Select image tag: use release tag (e.g., v1.0.0); else default to latest ---
+      - name: Set image tag from release
+        id: tags
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+
+      # --- Terraform setup and apply ---
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          TF_LOG: WARN
+        run: |
+          terraform apply -auto-approve \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "docker_image_repo=${{ env.DOCKER_IMAGE_REPO }}" \
+            -var "docker_image_tag=${{ steps.tags.outputs.tag }}" \
+            -var "app_port=8080"
+
+      # --- Get the public URL from Terraform outputs ---
+      - name: Terraform output
+        id: tfout
+        working-directory: terraform
+        run: |
+          APP_URL=$(terraform output -raw app_url)
+          echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Post deployment summary
+        run: |
+          echo "Deployment complete. App URL: ${{ steps.tfout.outputs.app_url }}"
